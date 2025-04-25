@@ -42,6 +42,7 @@ const userRoutes = require('./routes/user');
 const subscriptionRoutes = require('./routes/subscription');
 const paymentRoutes = require('./routes/payment');
 const employeeRoutes = require('./routes/employee');
+const reportRoutes = require('./routes/reportRoutes');
 app.use('/api/auth', authRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/products', productRoutes);
@@ -55,7 +56,7 @@ app.use('/api/users', userRoutes);
 app.use('/api/subscription', subscriptionRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/employees', employeeRoutes);
-
+app.use('/api/reports', reportRoutes);
 app.use((req, res, next) => {
   res.on('finish', () => {
     if (res.statusCode === 400 || res.statusCode === 401) {
