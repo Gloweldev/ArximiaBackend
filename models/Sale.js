@@ -27,6 +27,8 @@ const SaleSchema = new Schema({
   clubId: { type: Schema.Types.ObjectId, ref: 'Tienda', required: true }  // <— asociar al club
 }, { timestamps: { createdAt: 'created_at' } });
 
+
+
 module.exports = mongoose.model('Sale', SaleSchema);
 
 

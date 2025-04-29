@@ -4,12 +4,12 @@ const router = express.Router();
 const Tienda = require('../models/Tienda'); // Asegúrate de tener el modelo correcto para Tienda
 const authMiddleware = require('../middlewares/auth');
 const User = require('../models/User');
-
 const Sale = require('../models/Sale');
 const Expense = require('../models/Expense');
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Inventory = require('../models/Inventory');
+const Client = require('../models/Client'); // Asegúrate de tener el modelo correcto para Client
 
 // GET /api/reports/clubs — devuelve lista de clubs para filtros
 router.get('/clubs', authMiddleware, async (req, res) => {
@@ -884,7 +884,177 @@ router.get('/expenses', authMiddleware, async (req, res) => {
   }
 });
 
+// Agregar esta nueva ruta en reportRoutes.js
+router.get('/inventory', authMiddleware, async (req, res) => {
+  try {
+    const { clubId } = req.query;
+    const userId = req.userId;
 
+    const owner = await User.findById(userId);
+    if (!owner) {
+      return res.status(401).json({ message: "No autorizado" });
+    }
+
+    // Filtro de club
+    const clubFilter = clubId && clubId !== 'all' 
+      ? { clubId: new mongoose.Types.ObjectId(clubId) }
+      : { clubId: { $in: owner.clubs.map(id => new mongoose.Types.ObjectId(id)) } };
+
+    // Obtener el usuario y sus preferencias
+    const user = await User.findById(userId);
+    const inventarioIdeal = user?.preferenciasOperativas?.inventarioIdeal || {
+      sealed: 10,
+      prepared: 20
+    };
+
+    // Obtener todas las consultas necesarias en paralelo
+    const [inventorySummary, productTypes, inventoryDetails] = await Promise.all([
+      // Resumen del inventario
+      Inventory.aggregate([
+        { $match: clubFilter },
+        {
+          $group: {
+            _id: null,
+            totalProducts: { $sum: 1 },
+            lowStock: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $lt: ["$sealed", inventarioIdeal.sealed] },
+                      { 
+                        $lt: [
+                          "$preparation.currentPortions",
+                          inventarioIdeal.prepared
+                        ]
+                      }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        }
+      ]),
+
+      // Distribución por tipo de producto
+      Product.aggregate([
+        { $match: clubFilter },
+        {
+          $group: {
+            _id: "$type",
+            count: { $sum: 1 },
+            totalValue: {
+              $sum: "$purchasePrice"
+            }
+          }
+        }
+      ]),
+
+      // Detalles del inventario
+      Inventory.aggregate([
+        { $match: clubFilter },
+        {
+          $lookup: {
+            from: 'products',
+            localField: 'product',
+            foreignField: '_id',
+            as: 'productInfo'
+          }
+        },
+        { $unwind: '$productInfo' },
+        {
+          $addFields: {
+            minStock: {
+              sealed: inventarioIdeal.sealed,
+              prepared: inventarioIdeal.prepared
+            }
+          }
+        },
+        {
+          $project: {
+            name: '$productInfo.name',
+            type: '$productInfo.type',
+            sealed: '$sealed',
+            preparation: {
+              units: '$preparation.units',
+              currentPortions: '$preparation.currentPortions',
+              portionsPerUnit: '$productInfo.portions'
+            },
+            minStock: 1,
+            cost: '$productInfo.purchasePrice',
+            price: {
+              $cond: {
+                if: { $eq: ['$productInfo.type', 'sealed'] },
+                then: '$productInfo.salePrice',
+                else: '$productInfo.portionPrice'
+              }
+            },
+            lastMovement: '$updatedAt',
+            rotationDays: {
+              $divide: [
+                { $subtract: [new Date(), '$updatedAt'] },
+                1000 * 60 * 60 * 24
+              ]
+            }
+          }
+        }
+      ])
+    ]);
+
+    // Calcular valor total y promedio de rotación
+    const totalValue = productTypes.reduce((sum, type) => sum + type.totalValue, 0);
+    const averageRotation = Math.round(
+      inventoryDetails.reduce((sum, item) => sum + item.rotationDays, 0) / 
+      inventoryDetails.length
+    );
+    console.log('lowStock:', inventorySummary[0]?.lowStock);  
+
+    res.json({
+      stats: {
+        totalValue,
+        totalProducts: inventorySummary[0]?.totalProducts || 0,
+        lowStock: inventorySummary[0]?.lowStock || 0,
+        averageRotation
+      },
+      categories: productTypes.map(type => ({
+        name: type._id === 'sealed' ? 'Sellados' : 
+              type._id === 'prepared' ? 'Preparados' : 'Ambos',
+        count: type.count,
+        value: type.totalValue
+      })),
+      products: inventoryDetails
+    });
+
+  } catch (error) {
+    console.error('Error en reporte de inventario:', error);
+    res.status(500).json({ message: 'Error al generar el reporte de inventario' });
+  }
+});
+
+// Agregar esta nueva función específica para cashflow
+const getCashflowDateRange = (date) => {
+  const current = new Date(date);
+  current.setUTCHours(0, 0, 0, 0);
+  
+  const firstday = new Date(current);
+  const lastday = new Date(current);
+  
+  if (current.getUTCDay() === 0) { // Si es domingo
+    firstday.setUTCDate(current.getUTCDate() - 6); // Ir al lunes anterior
+    lastday.setUTCDate(current.getUTCDate()); // Mantener el domingo
+  } else {
+    firstday.setUTCDate(current.getUTCDate() - current.getUTCDay() + 1); // Ir al lunes
+    lastday.setUTCDate(firstday.getUTCDate() + 6); // Ir al domingo
+  }
+  
+  firstday.setUTCHours(0, 0, 0, 0);
+  lastday.setUTCHours(23, 59, 59, 999);
+
+  return { firstday, lastday };
+};
 
 router.get('/cashflow', authMiddleware, async (req, res) => {
   try {
@@ -900,19 +1070,16 @@ router.get('/cashflow', authMiddleware, async (req, res) => {
     let startDate, endDate;
     
     if (period === 'week') {
-      const weekDates = getWeekDates(date || new Date());
+      const weekDates = getCashflowDateRange(date || new Date());
       startDate = weekDates.firstday;
       endDate = weekDates.lastday;
     } else if (period === 'year') {
-      // Para vista anual, usar el mes actual
-      startDate = new Date(year, month - 1, 1);
-      endDate = new Date(year, month, 0);
-      endDate.setHours(23, 59, 59, 999);
+      startDate = new Date(Date.UTC(year, month - 1, 1));
+      endDate = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
     } else {
       // Para vista mensual
       startDate = new Date(Date.UTC(year, month - 1, 1));
-      endDate = new Date(Date.UTC(year, month, 0));
-      endDate.setHours(23, 59, 59, 999);
+      endDate = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
     }
 
     // Ajustar a la zona horaria de México (UTC-6)
@@ -942,21 +1109,19 @@ router.get('/cashflow', authMiddleware, async (req, res) => {
           }
         },
         {
-          $project: {
-            dateStr: {
+          $addFields: {
+            dateInMexicoCity: {
               $dateToString: {
                 format: "%Y-%m-%d",
                 date: "$created_at",
-                // Remover timezone para trabajar en UTC
-                timezone: "UTC"
+                timezone: "America/Mexico_City"
               }
-            },
-            total: 1
+            }
           }
         },
         {
           $group: {
-            _id: "$dateStr",
+            _id: "$dateInMexicoCity",
             inflow: { $sum: "$total" },
             transactionCount: { $sum: 1 }
           }
@@ -971,21 +1136,19 @@ router.get('/cashflow', authMiddleware, async (req, res) => {
           }
         },
         {
-          $project: {
-            dateStr: {
+          $addFields: {
+            dateInMexicoCity: {
               $dateToString: {
                 format: "%Y-%m-%d",
                 date: "$date",
-                // Remover timezone para trabajar en UTC
-                timezone: "UTC"
+                timezone: "America/Mexico_City"
               }
-            },
-            amount: 1
+            }
           }
         },
         {
           $group: {
-            _id: "$dateStr",
+            _id: "$dateInMexicoCity",
             outflow: { $sum: "$amount" },
             transactionCount: { $sum: 1 }
           }
@@ -1104,6 +1267,590 @@ router.get('/cashflow', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error en reporte de flujo de caja:', error);
     res.status(500).json({ message: 'Error al generar el reporte de flujo de caja' });
+  }
+});
+
+router.get('/customer-activity', authMiddleware, async (req, res) => {
+  try {
+    const { clubId, period, startDate, endDate } = req.query;
+    const userId = req.userId;
+
+    const owner = await User.findById(userId);
+    if (!owner) {
+      return res.status(401).json({ message: "No autorizado" });
+    }
+
+    const clubFilter = clubId && clubId !== 'all' 
+      ? { clubId: new mongoose.Types.ObjectId(clubId) }
+      : { clubId: { $in: owner.clubs.map(id => new mongoose.Types.ObjectId(id)) } };
+
+    const { start, end } = getPeriodDates(period, startDate, endDate);
+
+    // Obtener todos los clientes primero
+    const clients = await Client.find(clubFilter);
+    
+    // Obtener estadísticas de ventas por cliente
+    const [salesStats, customerTrend, topCustomers] = await Promise.all([
+      // Estadísticas generales y métricas adicionales
+      Sale.aggregate([
+        { 
+          $match: { 
+            ...clubFilter,
+            created_at: { $gte: start, $lte: end },
+            client: { $exists: true }
+          } 
+        },
+        {
+          $group: {
+            _id: null,
+            totalSales: { $sum: '$total' },
+            uniqueCustomers: { $addToSet: '$client' },
+            totalTransactions: { $sum: 1 },
+            averageTicket: { $avg: '$total' }
+          }
+        }
+      ]),
+
+      // Tendencia mensual - Generar todos los meses del año
+      (async () => {
+        const months = [];
+        const currentYear = new Date().getFullYear();
+        
+        // Crear array con todos los meses
+        for (let month = 0; month < 12; month++) {
+          const monthStart = new Date(currentYear, month, 1);
+          const monthEnd = new Date(currentYear, month + 1, 0);
+
+          const customersWithPurchases = await Sale.distinct('client', {
+            ...clubFilter,
+            created_at: {
+              $gte: monthStart,
+              $lte: monthEnd
+            }
+          });
+
+          const newCustomers = await Client.countDocuments({
+            ...clubFilter,
+            createdAt: {
+              $gte: monthStart,
+              $lte: monthEnd
+            }
+          });
+
+          months.push({
+            month: month + 1,
+            year: currentYear,
+            active: customersWithPurchases.length,
+            new: newCustomers
+          });
+        }
+        return months;
+      })(),
+
+      // Top clientes con más compras
+      Sale.aggregate([
+        { 
+          $match: { 
+            ...clubFilter,
+            created_at: { $gte: start, $lte: end },
+            client: { $exists: true }
+          }
+        },
+        {
+          $group: {
+            _id: '$client',
+            totalSpent: { $sum: '$total' },
+            purchaseCount: { $sum: 1 },
+            lastPurchase: { $max: '$created_at' },
+            averageTicket: { $avg: '$total' }
+          }
+        },
+        {
+          $lookup: {
+            from: 'clients',
+            localField: '_id',
+            foreignField: '_id',
+            as: 'clientInfo'
+          }
+        },
+        { $unwind: '$clientInfo' },
+        {
+          $project: {
+            _id: 1,
+            name: '$clientInfo.name',
+            type: '$clientInfo.type',
+            email: '$clientInfo.email',
+            phone: '$clientInfo.phone',
+            lastPurchase: 1,
+            totalSpent: 1,
+            purchaseCount: 1,
+            averageTicket: 1,
+            status: {
+              $cond: [
+                { $gte: ['$lastPurchase', new Date(new Date().setDate(new Date().getDate() - 30))] },
+                'active',
+                'inactive'
+              ]
+            }
+          }
+        },
+        { $sort: { totalSpent: -1 } },
+        { $limit: 10 }
+      ])
+    ]);
+
+    // Procesar y enriquecer datos de clientes
+    const enrichedClients = clients.map(client => {
+      const salesData = topCustomers.find(c => c._id.equals(client._id)) || {
+        totalSpent: 0,
+        purchaseCount: 0,
+        status: 'sin_compras',
+        lastPurchase: null,
+        averageTicket: 0
+      };
+
+      return {
+        _id: client._id,
+        name: client.name,
+        type: client.type,
+        email: client.email,
+        phone: client.phone,
+        createdAt: client.createdAt,
+        ...salesData
+      };
+    });
+
+    // Calcular métricas adicionales
+    const stats = {
+      totalCustomers: clients.length,
+      newCustomers: clients.filter(c => 
+        c.createdAt >= start && c.createdAt <= end
+      ).length,
+      totalSales: salesStats[0]?.totalSales || 0,
+      averageTicket: salesStats[0]?.averageTicket || 0,
+      purchaseFrequency: salesStats[0]?.totalTransactions 
+        ? salesStats[0].totalTransactions / salesStats[0].uniqueCustomers.length 
+        : 0
+    };
+
+    res.json({
+      stats,
+      trend: customerTrend,
+      topCustomers: enrichedClients
+        .sort((a, b) => b.totalSpent - a.totalSpent)
+        .slice(0, 10)
+    });
+
+  } catch (error) {
+    console.error('Error en reporte de actividad de clientes:', error);
+    res.status(500).json({ message: 'Error al generar el reporte de actividad de clientes' });
+  }
+});
+
+router.get('/transactions', authMiddleware, async (req, res) => {
+  try {
+    const { 
+      clubId, 
+      period, 
+      startDate, 
+      endDate, 
+      page = 1, 
+      limit = 10, 
+      tipo, 
+      busqueda,
+      responsable,
+      montoMin,
+      montoMax,
+      estado
+    } = req.query;
+    
+    const userId = req.userId;
+    const owner = await User.findById(userId);
+    if (!owner) {
+      return res.status(401).json({ message: "No autorizado" });
+    }
+
+    const { start, end } = getPeriodDates(period, startDate, endDate);
+    
+    // 1. Definir clubFilter antes de usarlo
+    const clubFilter = clubId && clubId !== 'all' 
+      ? { clubId: new mongoose.Types.ObjectId(clubId) }
+      : { clubId: { $in: owner.clubs.map(id => new mongoose.Types.ObjectId(id)) } };
+
+    // 2. Inicializar el array de queries
+    const queries = [];
+
+    // 3. Construir los filtros base
+    const ventasMatch = {
+      ...clubFilter,
+      created_at: { $gte: start, $lte: end },
+      status: 'completed'
+    };
+
+    const gastosMatch = {
+      ...clubFilter,
+      date: { $gte: start, $lte: end }
+    };
+
+    // 4. Agregar filtros adicionales
+    if (busqueda) {
+      ventasMatch.$or = [
+        { 'itemGroups.name': { $regex: busqueda, $options: 'i' } },
+        { 'itemGroups.items.product_id': { 
+          $in: await Product.find({ 
+            name: { $regex: busqueda, $options: 'i' } 
+          }).distinct('_id')
+        }}
+      ];
+      gastosMatch.description = { $regex: busqueda, $options: 'i' };
+    }
+
+    if (montoMin) {
+      ventasMatch.total = { $gte: parseFloat(montoMin) };
+      gastosMatch.amount = { $gte: parseFloat(montoMin) };
+    }
+
+    if (montoMax) {
+      if (ventasMatch.total) {
+        ventasMatch.total.$lte = parseFloat(montoMax);
+      } else {
+        ventasMatch.total = { $lte: parseFloat(montoMax) };
+      }
+      
+      if (gastosMatch.amount) {
+        gastosMatch.amount.$lte = parseFloat(montoMax);
+      } else {
+        gastosMatch.amount = { $lte: parseFloat(montoMax) };
+      }
+    }
+
+    // 5. Agregar queries según el tipo
+    if (!tipo || tipo === 'todos' || tipo === 'venta') {
+      queries.push(
+        Sale.aggregate([
+          { $match: ventasMatch },
+          { 
+            $lookup: {
+              from: 'users',
+              localField: 'employee',
+              foreignField: '_id',
+              as: 'employeeInfo'
+            }
+          },
+          { $unwind: '$employeeInfo' },
+          {
+            $match: responsable ? {
+              'employeeInfo.nombre': { $regex: responsable, $options: 'i' }
+            } : {}
+          },
+          // Nuevo: Expandir los itemGroups y hacer lookup a products
+          {
+            $addFields: {
+              itemGroups: {
+                $map: {
+                  input: '$itemGroups',
+                  as: 'group',
+                  in: {
+                    name: '$$group.name',
+                    items: {
+                      $map: {
+                        input: '$$group.items',
+                        as: 'item',
+                        in: {
+                          productId: '$$item.product_id',
+                          quantity: '$$item.quantity',
+                          unit_price: '$$item.unit_price',
+                          subtotal: { $multiply: ['$$item.quantity', '$$item.unit_price'] }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: 'products',
+              let: { items: '$itemGroups' },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $in: ['$_id', {
+                        $reduce: {
+                          input: '$$items',
+                          initialValue: [],
+                          in: {
+                            $concatArrays: [
+                              '$$value',
+                              {
+                                $map: {
+                                  input: '$$this.items',
+                                  as: 'item',
+                                  in: '$$item.productId'
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }]
+                    }
+                  }
+                }
+              ],
+              as: 'productsInfo'
+            }
+          },
+          {
+            $addFields: {
+              itemGroups: {
+                $map: {
+                  input: '$itemGroups',
+                  as: 'group',
+                  in: {
+                    name: '$$group.name',
+                    items: {
+                      $map: {
+                        input: '$$group.items',
+                        as: 'item',
+                        in: {
+                          $mergeObjects: [
+                            '$$item',
+                            {
+                              name: {
+                                $let: {
+                                  vars: {
+                                    product: {
+                                      $arrayElemAt: [
+                                        {
+                                          $filter: {
+                                            input: '$productsInfo',
+                                            cond: { $eq: ['$$this._id', '$$item.productId'] }
+                                          }
+                                        },
+                                        0
+                                      ]
+                                    }
+                                  },
+                                  in: '$$product.name'
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    subtotal: {
+                      $sum: {
+                        $map: {
+                          input: '$$group.items',
+                          as: 'item',
+                          in: { $multiply: ['$$item.quantity', '$$item.unit_price'] }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            $project: {
+              fecha: '$created_at',
+              tipo: 'venta',
+              descripcion: 'Da click para ver más detalles',
+              monto: '$total',
+              itemGroups: 1,
+              responsable: {
+                nombre: '$employeeInfo.nombre',
+                _id: '$employeeInfo._id'
+              },
+              estado: 1
+            }
+          }
+        ])
+      );
+    }
+
+    if (!tipo || tipo === 'todos' || tipo === 'gasto') {
+      queries.push(
+        Expense.aggregate([
+          { $match: gastosMatch },
+          {
+            $lookup: {
+              from: 'users',
+              localField: 'user',
+              foreignField: '_id',
+              as: 'userInfo'
+            }
+          },
+          { $unwind: '$userInfo' },
+          {
+            $match: responsable ? {
+              'userInfo.nombre': { $regex: responsable, $options: 'i' }
+            } : {}
+          },
+          {
+            $project: {
+              fecha: '$date',
+              tipo: 'gasto',
+              descripcion: '$description',
+              monto: { $multiply: ['$amount', -1] },
+              responsable: {
+                nombre: '$userInfo.nombre',
+                _id: '$userInfo._id'
+              },
+              estado: 'completado'
+            }
+          }
+        ])
+      );
+    }
+
+    // 6. Ejecutar queries y aplicar paginación
+    const results = await Promise.all(queries);
+    const todosLosMovimientos = results
+      .flat()
+      .sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
+
+    const total = todosLosMovimientos.length;
+    const totalPaginas = Math.ceil(total / 10);
+    const skip = (page - 1) * 10;
+    const movimientos = todosLosMovimientos.slice(skip, skip + 10);
+
+    res.json({
+      movimientos,
+      paginacion: {
+        total,
+        totalPaginas,
+        paginaActual: parseInt(page),
+        porPagina: 10
+      }
+    });
+
+  } catch (error) {
+    console.error('Error en historial de movimientos:', error);
+    res.status(500).json({ message: 'Error al obtener historial de movimientos' });
+  }
+});
+
+router.get('/club-performance', authMiddleware, async (req, res) => {
+  try {
+    const { period, startDate, endDate } = req.query;
+    const userId = req.userId;
+
+    const owner = await User.findById(userId);
+    if (!owner || !owner.clubs || owner.clubs.length === 0) {
+      return res.status(404).json({ message: 'No se encontraron clubs' });
+    }
+
+    const { start, end } = getPeriodDates(period, startDate, endDate);
+    const { previousStart, previousEnd } = getPreviousPeriodDates(period, new Date(start), new Date(end));
+
+    // Obtener datos de todos los clubs del usuario
+    const clubsData = await Promise.all(owner.clubs.map(async (clubId) => {
+      const club = await Tienda.findById(clubId);
+      if (!club) return null;
+
+      // Obtener ventas actuales y anteriores
+      const [currentSales, previousSales, employeesCount, clientsCount, topProducts] = await Promise.all([
+        Sale.aggregate([
+          { 
+            $match: { 
+              clubId,
+              created_at: { $gte: start, $lte: end },
+              status: 'completed'
+            }
+          },
+          { $group: { _id: null, total: { $sum: '$total' } } }
+        ]),
+        Sale.aggregate([
+          {
+            $match: {
+              clubId,
+              created_at: { $gte: previousStart, $lte: previousEnd },
+              status: 'completed'
+            }
+          },
+          { $group: { _id: null, total: { $sum: '$total' } } }
+        ]),
+        User.countDocuments({ clubs: clubId }),
+        Client.countDocuments({ clubId }),
+        Sale.aggregate([
+          {
+            $match: {
+              clubId,
+              created_at: { $gte: start, $lte: end },
+              status: 'completed'
+            }
+          },
+          { $unwind: '$itemGroups' },
+          { $unwind: '$itemGroups.items' },
+          {
+            $group: {
+              _id: '$itemGroups.items.product_id',
+              sales: { $sum: '$itemGroups.items.quantity' }
+            }
+          },
+          { $sort: { sales: -1 } },
+          { $limit: 3 },
+          {
+            $lookup: {
+              from: 'products',
+              localField: '_id',
+              foreignField: '_id',
+              as: 'productInfo'
+            }
+          },
+          { $unwind: '$productInfo' },
+          {
+            $project: {
+              name: '$productInfo.name',
+              sales: 1
+            }
+          }
+        ])
+      ]);
+
+      // Calcular ganancias (ejemplo simplificado)
+      const currentProfit = currentSales[0]?.total * 0.4 || 0;
+      const previousProfit = previousSales[0]?.total * 0.4 || 0;
+
+      return {
+        id: club._id.toString(),
+        name: club.nombre,
+        image: club.image || 'https://images.unsplash.com/photo-1534438327276-14e5300c3a48',
+        totalSales: currentSales[0]?.total || 0,
+        totalProfit: currentProfit,
+        employeesCount,
+        clientsCount,
+        rating: 4.5, // Podrías implementar un sistema real de calificaciones
+        performance: {
+          sales: {
+            current: currentSales[0]?.total || 0,
+            previous: previousSales[0]?.total || 0
+          },
+          profit: {
+            current: currentProfit,
+            previous: previousProfit
+          },
+          clients: {
+            current: clientsCount,
+            previous: clientsCount - Math.floor(clientsCount * 0.1) // Simulación
+          }
+        },
+        topProducts
+      };
+    }));
+
+    // Filtrar nulls y enviar respuesta
+    const validClubs = clubsData.filter(club => club !== null);
+    res.json(validClubs);
+
+  } catch (error) {
+    console.error('Error en rendimiento de clubs:', error);
+    res.status(500).json({ message: 'Error al obtener rendimiento de clubs' });
   }
 });
 
