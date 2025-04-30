@@ -685,7 +685,7 @@ router.get('/products', authMiddleware, async (req, res) => {
         }
       },
       { $sort: { totalSales: -1 } },
-      { $limit: 10 }
+      { $limit: 5 }  // Cambiado de 10 a 5
     ]);
 
     // Obtener información adicional de los productos
@@ -1753,8 +1753,8 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
       const club = await Tienda.findById(clubId);
       if (!club) return null;
 
-      // Obtener ventas actuales y anteriores
-      const [currentSales, previousSales, employeesCount, clientsCount, topProducts] = await Promise.all([
+      const [currentSales, previousSales, currentExpenses, previousExpenses, employeesCount, clientsCount, topProducts] = await Promise.all([
+        // Ventas actuales
         Sale.aggregate([
           { 
             $match: { 
@@ -1765,6 +1765,7 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
           },
           { $group: { _id: null, total: { $sum: '$total' } } }
         ]),
+        // Ventas anteriores
         Sale.aggregate([
           {
             $match: {
@@ -1775,8 +1776,29 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
           },
           { $group: { _id: null, total: { $sum: '$total' } } }
         ]),
+        // Gastos actuales
+        Expense.aggregate([
+          {
+            $match: {
+              clubId,
+              date: { $gte: start, $lte: end }
+            }
+          },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]),
+        // Gastos anteriores
+        Expense.aggregate([
+          {
+            $match: {
+              clubId,
+              date: { $gte: previousStart, $lte: previousEnd }
+            }
+          },
+          { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]),
         User.countDocuments({ clubs: clubId }),
         Client.countDocuments({ clubId }),
+        // Top productos como una consulta independiente
         Sale.aggregate([
           {
             $match: {
@@ -1790,11 +1812,10 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
           {
             $group: {
               _id: '$itemGroups.items.product_id',
-              sales: { $sum: '$itemGroups.items.quantity' }
+              sales: { $sum: '$itemGroups.items.quantity' },
+              totalSales: { $sum: { $multiply: ['$itemGroups.items.quantity', '$itemGroups.items.unit_price'] } }
             }
           },
-          { $sort: { sales: -1 } },
-          { $limit: 3 },
           {
             $lookup: {
               from: 'products',
@@ -1807,37 +1828,47 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
           {
             $project: {
               name: '$productInfo.name',
-              sales: 1
+              sales: 1,
+              profit: {
+                $multiply: [
+                  '$sales',
+                  { $subtract: ['$itemGroups.items.unit_price', '$productInfo.purchasePrice'] }
+                ]
+              }
             }
-          }
+          },
+          { $sort: { sales: -1 } },
+          { $limit: 3 }
         ])
       ]);
 
-      // Calcular ganancias (ejemplo simplificado)
-      const currentProfit = currentSales[0]?.total * 0.4 || 0;
-      const previousProfit = previousSales[0]?.total * 0.4 || 0;
+      // Cálculo de ganancias actual y anterior
+      const currentTotalSales = currentSales[0]?.total || 0;
+      const currentTotalExpenses = currentExpenses[0]?.total || 0;
+      const previousTotalSales = previousSales[0]?.total || 0;
+      const previousTotalExpenses = previousExpenses[0]?.total || 0;
 
       return {
         id: club._id.toString(),
         name: club.nombre,
         image: club.image || 'https://images.unsplash.com/photo-1534438327276-14e5300c3a48',
-        totalSales: currentSales[0]?.total || 0,
-        totalProfit: currentProfit,
+        totalSales: currentTotalSales,
+        totalProfit: currentTotalSales - currentTotalExpenses,
         employeesCount,
         clientsCount,
-        rating: 4.5, // Podrías implementar un sistema real de calificaciones
+        rating: 4.5,
         performance: {
           sales: {
-            current: currentSales[0]?.total || 0,
-            previous: previousSales[0]?.total || 0
+            current: currentTotalSales,
+            previous: previousTotalSales
           },
           profit: {
-            current: currentProfit,
-            previous: previousProfit
+            current: currentTotalSales - currentTotalExpenses,
+            previous: previousTotalSales - previousTotalExpenses
           },
           clients: {
             current: clientsCount,
-            previous: clientsCount - Math.floor(clientsCount * 0.1) // Simulación
+            previous: clientsCount - Math.floor(clientsCount * 0.1)
           }
         },
         topProducts
