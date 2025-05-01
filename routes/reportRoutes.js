@@ -10,6 +10,11 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Inventory = require('../models/Inventory');
 const Client = require('../models/Client'); // Asegúrate de tener el modelo correcto para Client
+const {generateReport,
+  generateFinancialReport,
+  calculateDateRange,
+  generatePDFReport,
+  generateExcelReport} = require('../services/reportGenerators'); // Asegúrate de tener el servicio correcto para generar reportes
 
 // GET /api/reports/clubs — devuelve lista de clubs para filtros
 router.get('/clubs', authMiddleware, async (req, res) => {
@@ -1884,5 +1889,111 @@ router.get('/club-performance', authMiddleware, async (req, res) => {
     res.status(500).json({ message: 'Error al obtener rendimiento de clubs' });
   }
 });
+
+// GET /api/reports/user-info
+router.get('/user-info', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select('nombre apellido role').lean();
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    // Asegurar que se envía solo el nombre completo sin undefined
+    const nombreCompleto = `${user.nombre || ''} ${user.apellido || ''}`.trim();
+
+    return res.json({
+      nombreCompleto,
+      role: user.role
+    });
+  } catch (error) {
+    console.error('Error al obtener información del usuario:', error);
+    return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+});
+
+// Agregar el endpoint para exportación
+router.post('/export', authMiddleware, async (req, res) => {
+  try {
+    const { 
+      reportType,
+      format,
+      period,
+      dateRange,
+      clubs,
+      includeCharts,
+      includeDetails,
+      customNotes
+    } = req.body;
+
+    console.log('Export Request:', {
+      reportType,
+      format,
+      period,
+      dateRange,
+      clubs,
+      includeCharts,
+      includeDetails
+    });
+
+    // Get user for report metadata
+    const user = await User.findById(req.userId);
+    console.log('User Data:', {
+      id: user._id,
+      nombre: user.nombre,
+      apellido: user.apellido,
+      role: user.role
+    });
+
+    const reportConfig = {
+      format,
+      user: {
+        nombreCompleto: `${user.nombre} ${user.apellido}`,
+        role: user.role
+      },
+      metadata: {
+        period,
+        dateRange,
+        clubs: await getClubNames(clubs),
+        reportType
+      },
+      includeCharts,
+      includeDetails,
+      customNotes
+    };
+
+    // Obtener datos del reporte
+    const reportData = await generateFinancialReport(clubs, period, dateRange);
+    console.log('Generated Report Data:', {
+      totalSales: reportData.financialMetrics?.sales?.total,
+      totalExpenses: reportData.financialMetrics?.expenses?.total,
+      netProfit: reportData.financialMetrics?.netProfit
+    });
+
+    // Generar el reporte en el formato solicitado
+    const { buffer, extension, contentType } = await generateReport({
+      ...reportConfig,
+      reportData
+    });
+
+    // Configurar headers para descarga
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', 
+      `attachment; filename=reporte_${reportType}_${new Date().toISOString().split('T')[0]}.${extension}`);
+
+    return res.send(buffer);
+
+  } catch (error) {
+    console.error('Error generating report:', error);
+    res.status(500).json({ message: 'Error al generar el reporte' });
+  }
+});
+
+// Función auxiliar para obtener nombres de clubs
+async function getClubNames(clubIds) {
+  const clubs = await Tienda.find({ 
+    _id: { $in: clubIds.map(id => new mongoose.Types.ObjectId(id)) } 
+  }).select('nombre');
+  return clubs.map(c => c.nombre);
+}
 
 module.exports = router;
