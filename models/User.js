@@ -33,7 +33,8 @@ const UserSchema = new Schema({
   passwordChangeLockUntil: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
-  onboardingCompleted: { type: Boolean, default: false }
+  onboardingCompleted: { type: Boolean, default: false },
+  inventarioIdeal: { type: Number, default: 5, min: 1 } // Añadir validación mínima
 });
 
 

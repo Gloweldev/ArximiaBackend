@@ -4,19 +4,66 @@ const Inventory = require('../models/Inventory');
 const Movement = require('../models/Movement');
 const Product = require('../models/Product');
 const authMiddleware = require('../middlewares/auth');
+const User = require('../models/User');
 
 // Obtener inventario por club
 router.get('/club/:clubId', authMiddleware, async (req, res) => {
   try {
     const { clubId } = req.params;
-    // Se obtienen los registros de inventory con la información del producto
+    const { userId } = req;
+
+    const user = await User.findById(userId);
+    const idealStock = user?.inventarioIdeal || 5;
+
     const inventory = await Inventory.find({ clubId }).populate('product');
-    res.json(inventory);
+    
+    const updatedInventory = inventory.map(item => {
+      // Calcular estado para stock sellado
+      const sealedStatus = calculateStatus(item.sealed || 0, idealStock);
+      
+      // Calcular estado para preparaciones (usando unidades, no porciones)
+      const prepStatus = calculateStatus(item.preparation?.units || 0, idealStock);
+      
+      // Para productos de tipo "both", mantenemos ambos estados
+      let status;
+      if (item.product.type === 'both') {
+        status = {
+          sealed: sealedStatus,
+          preparation: prepStatus
+        };
+      } else if (item.product.type === 'sealed') {
+        status = sealedStatus;
+      } else {
+        status = prepStatus;
+      }
+
+      return {
+        ...item.toObject(),
+        product: {
+          ...item.product.toObject(),
+          status
+        }
+      };
+    });
+
+    res.json(updatedInventory);
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Error al obtener inventario' });
   }
 });
+
+// Función auxiliar para calcular el estado
+function calculateStatus(currentStock, idealStock) {
+  if (currentStock <= 0) {
+    return 'critical';
+  } else if (currentStock < idealStock) {
+    return 'low';
+  } else {
+    return 'normal';
+  }
+}
+
 // Registrar un movimiento de inventario
 router.post('/movement', authMiddleware, async (req, res) => {
   try {
@@ -42,35 +89,36 @@ router.post('/movement', authMiddleware, async (req, res) => {
 
     let inventory = await Inventory.findOne({ product: productId, clubId });
     if (!inventory) {
-      // Se crea el inventario inicial si no existe
       inventory = new Inventory({ product: productId, clubId });
-      // En productos para preparación se debe inicializar el objeto preparation
       if (!inventory.preparation) {
         inventory.preparation = { units: 0, portionsPerUnit: 0, currentPortions: 0 };
       }
     }
 
-    if (type === 'compra' && purchasePrice ) {
-      const totalAmount = quantity * parseFloat(purchasePrice);
-      const Expense = require('../models/Expense');
-      const expense = new Expense({
-        clubId,
-        product: productId,
-        category: 'producto',
-        amount: totalAmount,
-        description: `Compra de inventario: ${description}`,
-        user: req.userId
-      });
-      await expense.save();
+    // Asegurarnos de que el tipo de movimiento 'compra' actualice el stock correctamente
+    if (type === 'compra') {
       if (unit === 'sealed') {
         inventory.sealed = (inventory.sealed || 0) + quantity;
       } else if (unit === 'portion') {
-        // Para productos de preparación (o mixtos) se incrementan las unidades compradas...
         inventory.preparation.units = (inventory.preparation.units || 0) + quantity;
-        // ...y se calculan las nuevas porciones según el valor de portionsPerUnit.
         const portionsPerUnit = inventory.preparation.portionsPerUnit || 1;
         const portionsToAdd = quantity * portionsPerUnit;
         inventory.preparation.currentPortions = (inventory.preparation.currentPortions || 0) + portionsToAdd;
+      }
+      
+      // Si viene de un gasto, registramos el gasto
+      if (purchasePrice) {
+        const totalAmount = quantity * parseFloat(purchasePrice);
+        const Expense = require('../models/Expense');
+        const expense = new Expense({
+          clubId,
+          product: productId,
+          category: 'producto',
+          amount: totalAmount,
+          description: `Compra de inventario: ${description}`, // La descripción viene ya formateada del frontend
+          user: req.userId
+        });
+        await expense.save();
       }
     } else if (type === 'venta') {
       if (unit === 'sealed') {
@@ -107,23 +155,107 @@ router.post('/movement', authMiddleware, async (req, res) => {
   }
 });
 
-// Obtener historial de movimientos para un producto
+// Actualizar el endpoint de movements
 router.get('/movements/:inventoryId', authMiddleware, async (req, res) => {
   try {
     const { inventoryId } = req.params;
+    const { from, to } = req.query;
+
     // Obtener el documento de inventario usando el ID del inventario
     const invDoc = await Inventory.findById(inventoryId);
     if (!invDoc) {
       return res.status(404).json({ message: 'Inventario no encontrado' });
     }
-    // Extraer el product ID del inventario
-    const productId = invDoc.product;
-    // Consultar movimientos usando el productId del catálogo
-    const movements = await Movement.find({ product: productId }).populate('user', 'nombre email');
+
+    // Construir el query base
+    const query = { 
+      product: invDoc.product,
+      date: {}
+    };
+
+    // Añadir filtros de fecha si existen
+    if (from) {
+      query.date.$gte = new Date(from);
+    }
+    if (to) {
+      query.date.$lte = new Date(to);
+    }
+
+    // Si no hay filtros de fecha, eliminar el objeto date vacío
+    if (Object.keys(query.date).length === 0) {
+      delete query.date;
+    }
+
+    // Consultar movimientos usando el query construido
+    const movements = await Movement.find(query)
+      .populate('user', 'nombre email')
+      .sort({ date: -1 });
+
     res.json(movements);
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Error al obtener el historial' });
+  }
+});
+
+// Actualizar estados basados en inventario ideal
+router.post('/update-states/:clubId', authMiddleware, async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    const { userId } = req;
+
+    // Obtener el inventario ideal del usuario
+    const user = await User.findById(userId);
+    if (!user || !user.inventarioIdeal) {
+      return res.status(400).json({ message: 'No se encontró el inventario ideal del usuario' });
+    }
+
+    const idealStock = user.inventarioIdeal;
+    console.log('Inventario ideal:', idealStock);
+    const inventory = await Inventory.find({ clubId }).populate('product');
+
+    const updatedItems = [];
+    
+    for (const item of inventory) {
+      let currentStock = 0;
+
+      // Calcular stock total (sellado + porciones)
+      if (item.sealed) {
+        currentStock += item.sealed;
+      }
+      if (item.preparation && item.preparation.currentPortions) {
+        currentStock += item.preparation.currentPortions;
+      }
+
+      // Determinar nuevo estado
+      let status;
+      if (currentStock <= 0) {
+        status = 'critical';
+      } else if (currentStock < idealStock) {
+        status = 'low';
+      } else {
+        status = 'normal';
+      }
+
+      // Actualizar el estado en el producto
+      await Product.findByIdAndUpdate(item.product._id, { status });
+      updatedItems.push({
+        productId: item.product._id,
+        name: item.product.name,
+        currentStock,
+        status
+      });
+    }
+
+    res.json({
+      message: 'Estados actualizados correctamente',
+      updatedItems,
+      idealStock
+    });
+
+  } catch (error) {
+    console.error('Error al actualizar estados:', error);
+    res.status(500).json({ message: 'Error al actualizar estados del inventario' });
   }
 });
 

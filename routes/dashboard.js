@@ -8,94 +8,133 @@ const authMiddleware = require('../middlewares/auth');
 const Sale = require('../models/Sale');
 const Expense = require('../models/Expense');
 const Inventory = require('../models/Inventory');
+const User = require('../models/User');
 
 // GET /api/dashboard/kpis?clubId=...
 router.get('/kpis', authMiddleware, async (req, res) => {
-    try {
-      const { clubId } = req.query;
-      if (!clubId) {
-        return res.status(400).json({ message: "El clubId es requerido" });
-      }
-  
-      // Período actual: mes actual
-      const now = new Date();
-      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-      const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-  
-      // Período anterior: mismo lapso que el mes actual, pero el mes anterior
-      const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      const startOfPrevMonth = new Date(prevMonth.getFullYear(), prevMonth.getMonth(), 1);
-      const endOfPrevMonth = new Date(prevMonth.getFullYear(), prevMonth.getMonth() + 1, 0, 23, 59, 59);
-  
-      // Consultar ventas y gastos en el período actual
-      const salesCurrent = await Sale.find({
+  try {
+    const { clubId } = req.query;
+    if (!clubId) {
+      return res.status(400).json({ message: "El clubId es requerido" });
+    }
+
+    // Obtener el inventario ideal del usuario
+    const user = await User.findById(req.userId);
+    const idealStock = user?.inventarioIdeal || 5;
+
+    // Período actual: mes actual
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+
+    // Período anterior: mes anterior completo
+    const startOfPrevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const endOfPrevMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+    // Consultas paralelas para mejorar rendimiento
+    const [salesCurrent, expensesCurrent, salesPrev, expensesPrev, criticalInventory] = await Promise.all([
+      Sale.find({
         clubId: new mongoose.Types.ObjectId(clubId),
         created_at: { $gte: startOfMonth, $lte: endOfMonth }
-      });
-      const expensesCurrent = await Expense.find({
+      }),
+      Expense.find({
         clubId: new mongoose.Types.ObjectId(clubId),
         date: { $gte: startOfMonth, $lte: endOfMonth }
-      });
-  
-      // Consultar ventas y gastos en el período anterior
-      const salesPrev = await Sale.find({
+      }),
+      Sale.find({
         clubId: new mongoose.Types.ObjectId(clubId),
         created_at: { $gte: startOfPrevMonth, $lte: endOfPrevMonth }
-      });
-      const expensesPrev = await Expense.find({
+      }),
+      Expense.find({
         clubId: new mongoose.Types.ObjectId(clubId),
         date: { $gte: startOfPrevMonth, $lte: endOfPrevMonth }
-      });
-  
-      // Calcular totales actuales
-      const salesTotalCurrent = salesCurrent.reduce((sum, sale) => sum + sale.total, 0);
-      const expensesTotalCurrent = expensesCurrent.reduce((sum, expense) => sum + expense.amount, 0);
-      const netProfitCurrent = salesTotalCurrent - expensesTotalCurrent;
-  
-      // Calcular totales del período anterior
-      const salesTotalPrev = salesPrev.reduce((sum, sale) => sum + sale.total, 0);
-      const netProfitPrev = salesTotalPrev - expensesPrev.reduce((sum, expense) => sum + expense.amount, 0);
-  
-      // Calcular tendencias (si el valor previo es mayor a 0)
-      const salesGrowth = salesTotalPrev > 0 
-        ? Number((((salesTotalCurrent - salesTotalPrev) / salesTotalPrev) * 100).toFixed(1))
-        : 0;
-      const netProfitGrowth = netProfitPrev > 0
-        ? Number((((netProfitCurrent - netProfitPrev) / netProfitPrev) * 100).toFixed(1))
-        : 0;
-  
-      // Inventario crítico: por ejemplo, se considera crítico si
-      // para productos sellados: stock < 5
-      // para productos de preparación: currentPortions < 10
-      const criticalInventory = await Inventory.find({
+      }),
+      // Consulta mejorada para inventario crítico
+      Inventory.find({
         clubId: new mongoose.Types.ObjectId(clubId),
         $or: [
-          { sealed: { $lt: 5 } },
-          { "preparation.currentPortions": { $lt: 10 } }
+          { sealed: { $lt: idealStock } },
+          { 
+            'preparation.currentPortions': { $lt: idealStock },
+            'preparation.portionsPerUnit': { $gt: 0 } // Solo si maneja porciones
+          }
         ]
-      }).populate('product', 'name flavor'); // Se asume que el modelo Product tiene estos campos
-  
-      // Armar lista de inventario crítico
-      const inventoryItems = criticalInventory.map(item => ({
-        name: item.product
-          ? `${item.product.name}${item.product.flavor ? " (" + item.product.flavor + ")" : ""}`
-          : "Producto desconocido",
-        stock: item.sealed < 5 ? `${item.sealed} unidades` : `${item.preparation.currentPortions} porciones`
+      }).populate('product', 'name flavor type')
+    ]);
+
+    // Debug logs para tendencias
+    console.log('Datos para cálculo de tendencias:', {
+      salesCurrent: {
+        total: salesCurrent.reduce((sum, sale) => sum + sale.total, 0),
+        count: salesCurrent.length,
+        period: 'Actual',
+        dates: salesCurrent.map(s => s.created_at)
+      },
+      salesPrev: {
+        total: salesPrev.reduce((sum, sale) => sum + sale.total, 0),
+        count: salesPrev.length,
+        period: 'Anterior',
+        dates: salesPrev.map(s => s.created_at)
+      },
+      expensesCurrent: {
+        total: expensesCurrent.reduce((sum, exp) => sum + exp.amount, 0),
+        count: expensesCurrent.length
+      },
+      expensesPrev: {
+        total: expensesPrev.reduce((sum, exp) => sum + exp.amount, 0),
+        count: expensesPrev.length
+      },
+      dateRanges: {
+        current: { start: startOfMonth, end: endOfMonth },
+        previous: { start: startOfPrevMonth, end: endOfPrevMonth }
+      }
+    });
+
+    // Calcular totales
+    const salesTotalCurrent = salesCurrent.reduce((sum, sale) => sum + sale.total, 0);
+    const expensesTotalCurrent = expensesCurrent.reduce((sum, expense) => sum + expense.amount, 0);
+    const salesTotalPrev = salesPrev.reduce((sum, sale) => sum + sale.total, 0);
+    const expensesTotalPrev = expensesPrev.reduce((sum, expense) => sum + expense.amount, 0);
+
+    // Calcular ganancias netas
+    const netProfitCurrent = salesTotalCurrent - expensesTotalCurrent;
+    const netProfitPrev = salesTotalPrev - expensesTotalPrev;
+
+    // Calcular porcentajes de crecimiento
+    const calculateGrowth = (current, previous) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return Number(((current - previous) / previous * 100).toFixed(1));
+    };
+
+    // Procesar inventario crítico
+    const inventoryItems = criticalInventory
+      .filter(item => {
+        // Solo incluir items que realmente tengan stock bajo
+        const currentStock = item.sealed || item.preparation?.units || 0;
+        return currentStock < idealStock;
+      })
+      .map(item => ({
+        name: `${item.product.name}${item.product.flavor ? ` (${item.product.flavor})` : ''}`,
+        stock: `${item.sealed || item.preparation?.units || 0} unidades`
       }));
-  
-      res.json({
-        salesTotal: salesTotalCurrent,
-        expensesTotal: expensesTotalCurrent,
-        netProfit: netProfitCurrent,
-        salesGrowth,
-        netProfitGrowth,
-        inventoryCritical: criticalInventory.length,
-        inventoryItems,
-      });
-    } catch (error) {
-      console.error("Error en /api/dashboard/kpis:", error);
-      res.status(500).json({ message: error.message || "Error al obtener los KPIs del dashboard" });
-    }
+
+    console.log("Inventario crítico:", inventoryItems);
+
+    res.json({
+      salesTotal: salesTotalCurrent,
+      expensesTotal: expensesTotalCurrent,
+      netProfit: netProfitCurrent,
+      salesGrowth: calculateGrowth(salesTotalCurrent, salesTotalPrev),
+      netProfitGrowth: calculateGrowth(netProfitCurrent, netProfitPrev),
+      inventoryCritical: inventoryItems.length,
+      inventoryItems,
+      inventoryIdeal: idealStock
+    });
+
+  } catch (error) {
+    console.error("Error en /api/dashboard/kpis:", error);
+    res.status(500).json({ message: error.message || "Error al obtener los KPIs del dashboard" });
+  }
 });
 
 router.get('/sales-vs-expenses', authMiddleware, async (req, res) => {

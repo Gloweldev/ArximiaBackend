@@ -10,6 +10,7 @@ const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Inventory = require('../models/Inventory');
 const Client = require('../models/Client'); // Asegúrate de tener el modelo correcto para Client
+const Movement = require('../models/Movement');
 const {generateReport,
   generateFinancialReport,
   calculateDateRange,
@@ -47,13 +48,16 @@ router.get('/clubs', authMiddleware, async (req, res) => {
 
 const getWeekDates = (date) => {
   const current = new Date(date);
-  const first = current.getDate() - current.getDay() + (current.getDay() === 0 ? -6 : 1);
-  const last = first + 6;
-
-  const firstday = new Date(current.setDate(first));
-  firstday.setHours(0, 0, 0, 0);
   
-  const lastday = new Date(current.setDate(last));
+  // Obtener el lunes (primer día de la semana)
+  const first = current.getDate() - current.getDay() + (current.getDay() === 0 ? -6 : 1);
+  const firstday = new Date(current);
+  firstday.setDate(first);
+  firstday.setHours(0, 0, 0, 0);
+
+  // Obtener el domingo (último día de la semana)
+  const lastday = new Date(firstday);
+  lastday.setDate(firstday.getDate() + 6);
   lastday.setHours(23, 59, 59, 999);
 
   return { firstday, lastday };
@@ -97,6 +101,9 @@ const getPeriodDates = (period, startDate, endDate) => {
       const weekDates = getWeekDates(now);
       start = weekDates.firstday;
       end = weekDates.lastday;
+      console.log('Week Dates:', weekDates);
+      console.log('Start:', start);
+      console.log('End:', end);
       break;
     case 'month':
       start = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -145,6 +152,7 @@ router.get('/financial', authMiddleware, async (req, res) => {
     switch (period) {
       case 'week':
         const weekDates = getWeekDates(now);
+        console.log('Week Dates:', weekDates);
         start = weekDates.firstday;
         end = weekDates.lastday;
         break;
@@ -702,7 +710,7 @@ router.get('/products', authMiddleware, async (req, res) => {
       const info = productsInfo.find(p => p._id.equals(product._id));
       return {
         ...product,
-        name: info?.name || 'Producto desconocido',
+        name: info ? `${info.name}${info.flavor ? ` - ${info.flavor}` : ''}` : 'Producto desconocido',
         cost: info?.purchasePrice || 0,
         price: info?.salePrice || info?.portionPrice || 0
       };
@@ -1702,6 +1710,65 @@ router.get('/transactions', authMiddleware, async (req, res) => {
               tipo: 'gasto',
               descripcion: '$description',
               monto: { $multiply: ['$amount', -1] },
+              responsable: {
+                nombre: '$userInfo.nombre',
+                _id: '$userInfo._id'
+              },
+              estado: 'completado'
+            }
+          }
+        ])
+      );
+    }
+
+    // Agregar query para ajustes si corresponde
+    if (!tipo || tipo === 'todos' || tipo === 'ajuste') {
+      queries.push(
+        Movement.aggregate([
+          { 
+            $match: {
+              ...clubFilter,
+              date: { $gte: start, $lte: end },
+              type: 'ajuste'
+            }
+          },
+          {
+            $lookup: {
+              from: 'users',
+              localField: 'user',
+              foreignField: '_id',
+              as: 'userInfo'
+            }
+          },
+          { $unwind: '$userInfo' },
+          {
+            $match: responsable ? {
+              'userInfo.nombre': { $regex: responsable, $options: 'i' }
+            } : {}
+          },
+          {
+            $lookup: {
+              from: 'products',
+              localField: 'product',
+              foreignField: '_id',
+              as: 'productInfo'
+            }
+          },
+          { $unwind: '$productInfo' },
+          {
+            $project: {
+              fecha: '$date',
+              tipo: 'ajuste',
+              motivo: '$description',
+              descripcion: '$description',
+              monto: { 
+                $multiply: ['$quantity', '$productInfo.purchasePrice'] 
+              },
+              productos: [{
+                nombre: '$productInfo.name',
+                cantidad: '$quantity',
+                tipo: '$unit'
+              }],
               responsable: {
                 nombre: '$userInfo.nombre',
                 _id: '$userInfo._id'

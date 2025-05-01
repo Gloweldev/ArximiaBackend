@@ -65,7 +65,6 @@ async function registerMovement(productId, clubId, type, quantity, unit, descrip
 
   let inventory = await Inventory.findOne({ product: productId, clubId });
   if (!inventory) {
-    // Crear registro de inventario inicial si no existe
     inventory = new Inventory({
       product: productId,
       clubId,
@@ -73,14 +72,41 @@ async function registerMovement(productId, clubId, type, quantity, unit, descrip
       preparation: { units: 0, portionsPerUnit: 0, currentPortions: 0 },
     });
   }
+
   // Actualización del inventario para venta
   if (type === 'venta') {
     if (unit === 'sealed') {
       inventory.sealed = (inventory.sealed || 0) - quantity;
     } else if (unit === 'portion') {
+      // Actualizar porciones actuales
       inventory.preparation.currentPortions = (inventory.preparation.currentPortions || 0) - quantity;
+
+      // Calcular unidades completas necesarias basado en las porciones restantes
+      const portionsPerUnit = inventory.preparation.portionsPerUnit || 30; // Valor por defecto si no existe
+      const remainingPortions = inventory.preparation.currentPortions;
+      
+      // Calcular cuántas unidades completas necesitamos para las porciones restantes
+      const neededUnits = Math.ceil(Math.max(0, remainingPortions) / portionsPerUnit);
+      
+      // Actualizar units para reflejar el número correcto de unidades completas
+      inventory.preparation.units = neededUnits;
+
+      // Si nos quedamos sin porciones, asegurarnos que todo esté en 0
+      if (remainingPortions <= 0) {
+        inventory.preparation.currentPortions = 0;
+        inventory.preparation.units = 0;
+      }
+
+      console.log('Actualización de inventario:', {
+        portionsPerUnit,
+        remainingPortions,
+        neededUnits,
+        newUnits: inventory.preparation.units,
+        newCurrentPortions: inventory.preparation.currentPortions
+      });
     }
   }
+
   inventory.updatedAt = new Date();
   await inventory.save();
 }

@@ -148,7 +148,6 @@ router.get('/client/:clientId', authMiddleware, async (req, res) => {
   }
 
   try {
-    // Construir el query
     const query = { client: clientId, clubId };
 
     if (start && end) {
@@ -158,9 +157,8 @@ router.get('/client/:clientId', authMiddleware, async (req, res) => {
       };
     }
 
-    const sales = await Sale.find(query).sort({ createdAt: -1 });
+    const sales = await Sale.find(query).sort({ created_at: -1 });
     
-    // Recolectar todos los productIds de los items de venta
     const productIds = [];
     sales.forEach(sale => {
       if (sale.itemGroups && sale.itemGroups.length) {
@@ -175,31 +173,32 @@ router.get('/client/:clientId', authMiddleware, async (req, res) => {
     });
     const uniqueProductIds = [...new Set(productIds)];
 
-    // Obtener los nombres de productos y mapear usando string como llave
-    const products = await Product.find({ _id: { $in: uniqueProductIds } }).select('name');
+    const products = await Product.find({ _id: { $in: uniqueProductIds } }).select('name flavor');
     const productMap = {};
     products.forEach(product => {
-      productMap[String(product._id)] = product.name;
+      productMap[String(product._id)] = {
+        name: product.name,
+        flavor: product.flavor || 'Sin sabor'
+      };
     });
 
-    // Transformar la estructura para que coincida con lo que espera el frontend
     const transformedSales = sales.map(sale => {
-      // Crear una estructura plana de items a partir de itemGroups
       const flatItems = [];
       if (sale.itemGroups && sale.itemGroups.length) {
         sale.itemGroups.forEach(group => {
           if (group.items && group.items.length) {
             group.items.forEach(item => {
+              const productInfo = productMap[String(item.product_id)] || { name: 'Desconocido', flavor: 'Sin sabor' };
               flatItems.push({
                 ...item.toObject(),
-                productName: productMap[String(item.product_id)] || 'Desconocido'
+                productName: productInfo.name,
+                flavor: productInfo.flavor
               });
             });
           }
         });
       }
       
-      // Crear un objeto de venta con la estructura que espera el frontend
       const saleObj = sale.toObject();
       saleObj.items = flatItems;
       return saleObj;

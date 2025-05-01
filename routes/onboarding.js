@@ -27,9 +27,10 @@ router.post('/', authMiddleware, async (req, res) => {
       tema: step2?.tema || 'Claro'
     };
     user.metas = {
-      metaVentasMensual: step3?.metaVentasMensual,
-      inventarioIdeal: step3?.diasInventario
+      metaVentasMensual: step3?.metaVentasMensual
     };
+    // Establecer inventarioIdeal directamente en el usuario
+    user.inventarioIdeal = step3?.diasInventario || 5; // Valor por defecto de 5
     user.tieneColaboradores = step1?.tienesColaboradores || false;
     user.displayName = step2.displayName || user.displayName;
     
