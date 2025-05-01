@@ -3,7 +3,7 @@ const router = express.Router();
 const mongoose = require('mongoose');
 const authMiddleware = require('../middlewares/auth');
 const User = require('../models/User');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const Tienda = require('../models/Tienda');
 
 // GET /api/users/me
