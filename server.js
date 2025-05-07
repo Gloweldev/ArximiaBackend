@@ -68,6 +68,7 @@ app.use((req, res, next) => {
   next();
 });
 
+console.log('→ Conectando a MongoDB con URI:', process.env.MONGO_URI);
 // Conexión a MongoDB
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
@@ -78,7 +79,8 @@ mongoose.connect(process.env.MONGODB_URI, {
 
 // Iniciar el servidor
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+const HOST = '0.0.0.0';          // <— clave para que Windows pueda “verlo”
+app.listen(PORT, HOST, () => {
   console.log(`Servidor corriendo en el puerto ${PORT}`);
 });
 

@@ -11,11 +11,6 @@ const Product = require('../models/Product');
 const Inventory = require('../models/Inventory');
 const Client = require('../models/Client'); // Asegúrate de tener el modelo correcto para Client
 const Movement = require('../models/Movement');
-const {generateReport,
-  generateFinancialReport,
-  calculateDateRange,
-  generatePDFReport,
-  generateExcelReport} = require('../services/reportGenerators'); // Asegúrate de tener el servicio correcto para generar reportes
 
 // GET /api/reports/clubs — devuelve lista de clubs para filtros
 router.get('/clubs', authMiddleware, async (req, res) => {
@@ -1978,82 +1973,6 @@ router.get('/user-info', authMiddleware, async (req, res) => {
   }
 });
 
-// Agregar el endpoint para exportación
-router.post('/export', authMiddleware, async (req, res) => {
-  try {
-    const { 
-      reportType,
-      format,
-      period,
-      dateRange,
-      clubs,
-      includeCharts,
-      includeDetails,
-      customNotes
-    } = req.body;
-
-    console.log('Export Request:', {
-      reportType,
-      format,
-      period,
-      dateRange,
-      clubs,
-      includeCharts,
-      includeDetails
-    });
-
-    // Get user for report metadata
-    const user = await User.findById(req.userId);
-    console.log('User Data:', {
-      id: user._id,
-      nombre: user.nombre,
-      apellido: user.apellido,
-      role: user.role
-    });
-
-    const reportConfig = {
-      format,
-      user: {
-        nombreCompleto: `${user.nombre} ${user.apellido}`,
-        role: user.role
-      },
-      metadata: {
-        period,
-        dateRange,
-        clubs: await getClubNames(clubs),
-        reportType
-      },
-      includeCharts,
-      includeDetails,
-      customNotes
-    };
-
-    // Obtener datos del reporte
-    const reportData = await generateFinancialReport(clubs, period, dateRange);
-    console.log('Generated Report Data:', {
-      totalSales: reportData.financialMetrics?.sales?.total,
-      totalExpenses: reportData.financialMetrics?.expenses?.total,
-      netProfit: reportData.financialMetrics?.netProfit
-    });
-
-    // Generar el reporte en el formato solicitado
-    const { buffer, extension, contentType } = await generateReport({
-      ...reportConfig,
-      reportData
-    });
-
-    // Configurar headers para descarga
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', 
-      `attachment; filename=reporte_${reportType}_${new Date().toISOString().split('T')[0]}.${extension}`);
-
-    return res.send(buffer);
-
-  } catch (error) {
-    console.error('Error generating report:', error);
-    res.status(500).json({ message: 'Error al generar el reporte' });
-  }
-});
 
 // Función auxiliar para obtener nombres de clubs
 async function getClubNames(clubIds) {
